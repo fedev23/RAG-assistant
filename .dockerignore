@@ -1,0 +1,9 @@
+.env
+ollama/backend/.env
+ollama/backend/data/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git
+.gitignore

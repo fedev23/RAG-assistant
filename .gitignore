@@ -1,0 +1,12 @@
+# Local environment
+.env/
+.venv/
+venv/
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+
+# Local runtime data
+ollama/backend/data/
+ollama/backend/.telegram_offset
