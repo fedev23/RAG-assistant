@@ -60,6 +60,8 @@ def _extract_categories(text: str) -> list[str] | None:
         categories.append("salida")
     if re.search(r"\bobligacion(es)?\b", text):
         categories.append("obligacion")
+    if re.search(r"\b(unclear|otro(s)?)\b", text):
+        categories.append("unclear")
     if not categories:
         return None
     return categories
@@ -81,6 +83,12 @@ def _is_query_candidate(text: str) -> bool:
         "suma",
         "sumar",
     )
+    analysis_phrases = (
+        "cada cosa",
+        "por categoria",
+        "por categorias",
+        "desglose",
+    )
     expense_context_words = (
         "gasto",
         "gaste",
@@ -90,9 +98,14 @@ def _is_query_candidate(text: str) -> bool:
         "salidas",
         "obligacion",
         "obligaciones",
+        "unclear",
+        "otro",
+        "otros",
     )
 
-    has_analysis_hint = any(word in text for word in analysis_words)
+    has_analysis_hint = any(word in text for word in analysis_words) or any(
+        phrase in text for phrase in analysis_phrases
+    )
     has_question_mark = text.endswith("?")
     has_relative_month_hint = "mes pasado" in text or "este mes" in text
     has_month_hint = has_relative_month_hint or _extract_month(text) is not None

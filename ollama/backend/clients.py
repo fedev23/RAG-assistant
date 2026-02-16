@@ -3,8 +3,13 @@ from typing import Any
 import urllib.error
 import urllib.parse
 import urllib.request
-
+from ollama.backend.parsing import collapse_spaces
+from ollama.backend.parsing import extract_explicit_amount
+from ollama.backend.parsing import normalize_category
 from ollama.backend.parsing import normalize_expense
+from ollama.backend.tuning import SIMILAR_EXAMPLES_LIMIT
+from ollama.backend.tuning import SIMILAR_EXAMPLE_TEXT_MAX_CHARS
+from ollama.backend.tuning import OLLAMA_EXTRACT_NUM_PREDICT
 
 
 def post_json(url: str, payload: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
@@ -67,16 +72,81 @@ def extract_sender_name(message: dict) -> str:
     )
 
 
-def call_ollama_extract(base_url: str, model: str, text: str, timeout: int = 60) -> dict | None:
+def _build_similarity_examples_block(similar_examples: list[dict[str, Any]] | None) -> str:
+    if not similar_examples:
+        return ""
+
+    lines: list[str] = []
+    for idx, example in enumerate(similar_examples[:SIMILAR_EXAMPLES_LIMIT], start=1):
+        category = str(example.get("category") or "unclear")
+        document = str(example.get("document") or "")
+        raw_text = document.split("raw_text=", 1)[-1] if "raw_text=" in document else document
+        raw_text = collapse_spaces(raw_text)[:SIMILAR_EXAMPLE_TEXT_MAX_CHARS]
+        lines.append(
+            f"{idx}. cat={category}; txt={raw_text}"
+        )
+
+    return "\n".join(lines)
+
+
+def _parse_json_like_response(raw_response: str) -> dict[str, Any] | None:
+    text = raw_response.strip()
+    if not text:
+        return None
+
+    candidates: list[str] = [text]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(text[start : end + 1])
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            return parsed[0]
+
+    return None
+
+
+def _first_present(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in data:
+            return data[key]
+    return None
+
+
+def call_ollama_extract(
+    base_url: str,
+    model: str,
+    text: str,
+    similar_examples: list[dict[str, Any]] | None = None,
+    timeout: int = 60,
+) -> dict | None:
     url = f"{base_url.rstrip('/')}/api/generate"
+    similar_examples_block = _build_similarity_examples_block(similar_examples)
+    context_line = (
+        f"Similar examples:\n{similar_examples_block}\n"
+        if similar_examples_block
+        else "Similar examples: none\n"
+    )
     prompt = (
         "Extract an expense from the user text (Spanish or English).\n"
         "Return ONLY valid JSON in this exact shape:\n"
-        '{"category":"salida|obligacion|otro","amount":<number or null>}\n'
+        '{"category":"salida|obligacion|unclear","amount":<number or null>}\n'
         "Rules:\n"
+        "- Use category='salida' for discretionary/leisure spending.\n"
+        "- Use category='obligacion' for essential/fixed/debt-related spending.\n"
         "- Use only explicit numeric amounts found in the user text.\n"
         "- Do not invent numbers.\n"
-        "- If there is no clear amount, return amount as null and category as 'otro'.\n"
+        "- If category is ambiguous, use 'unclear'.\n"
+        "- If there is no clear amount, return amount as null and category as 'unclear'.\n"
+        "- Use similar examples only as soft category hints, never for amount.\n"
+        f"{context_line}"
         f"User text: {text}"
     )
     payload = post_json(
@@ -86,7 +156,10 @@ def call_ollama_extract(base_url: str, model: str, text: str, timeout: int = 60)
             "prompt": prompt,
             "stream": False,
             "format": "json",
-            "options": {"temperature": 0},
+            "options": {
+                "temperature": 0,
+                "num_predict": OLLAMA_EXTRACT_NUM_PREDICT,
+            },
         },
         timeout=timeout,
     )
@@ -95,12 +168,34 @@ def call_ollama_extract(base_url: str, model: str, text: str, timeout: int = 60)
     if not isinstance(raw_response, str):
         return None
 
-    try:
-        parsed = json.loads(raw_response)
-    except json.JSONDecodeError:
+    parsed = _parse_json_like_response(raw_response)
+    if parsed is None:
+        amount = extract_explicit_amount(text)
+        if amount is None:
+            return None
+        return {
+            "category": "unclear",
+            "amount": amount,
+        }
+
+    raw_category = _first_present(parsed, ("category", "categoria", "tipo", "type"))
+    raw_amount = _first_present(parsed, ("amount", "monto", "valor", "value"))
+
+    normalized = normalize_expense(
+        str(raw_category) if raw_category is not None else None,
+        raw_amount,
+    )
+    if normalized is not None:
+        return normalized
+
+    amount = extract_explicit_amount(text)
+    if amount is None:
         return None
 
-    return normalize_expense(parsed.get("category"), parsed.get("amount"))
+    return {
+        "category": normalize_category(str(raw_category)) if raw_category is not None else "unclear",
+        "amount": amount,
+    }
 
 
 def call_ollama_embed(base_url: str, model: str, text: str, timeout: int = 60) -> list[float]:

@@ -48,7 +48,7 @@ def load_config() -> AppConfig:
     return AppConfig(
         token=token,
         ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-        ollama_extract_model=os.getenv("OLLAMA_EXTRACT_MODEL", "llama3.2:3b"),
+        ollama_extract_model=os.getenv("OLLAMA_EXTRACT_MODEL", "llama3.2:1b"),
         ollama_embed_model=os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
         timezone_name=os.getenv("APP_TIMEZONE", "UTC"),
         default_currency=os.getenv("APP_CURRENCY", "ARS"),

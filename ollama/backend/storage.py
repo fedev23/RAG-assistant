@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import logging
 from pathlib import Path
@@ -8,6 +9,7 @@ import chromadb
 
 from ollama.backend.clients import call_ollama_embed
 from ollama.backend.parsing import collapse_spaces
+from ollama.backend.tuning import SIMILAR_EXAMPLES_LIMIT
 
 
 def ensure_parent_dir(file_path: Path) -> None:
@@ -58,6 +60,7 @@ class ExpensePersistence:
         self.ollama_base_url = ollama_base_url
         self.ollama_embed_model = ollama_embed_model
         self.default_currency = default_currency
+        self._vector_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vector-upsert")
 
         self.logger.info("SQLite initialized at %s", db_path)
         self.logger.info("Chroma initialized at %s (collection=%s)", chroma_path, chroma_collection_name)
@@ -190,6 +193,93 @@ class ExpensePersistence:
             embeddings=[embedding],
         )
 
+    def _upsert_vector_background(
+        self,
+        expense_id: int,
+        chat_id: int,
+        category: str,
+        amount: float,
+        currency: str,
+        occurred_at: str,
+        month_key: str,
+        source: str,
+        raw_text: str,
+    ) -> None:
+        try:
+            self._upsert_vector(
+                expense_id=expense_id,
+                chat_id=chat_id,
+                category=category,
+                amount=amount,
+                currency=currency,
+                occurred_at=occurred_at,
+                month_key=month_key,
+                source=source,
+                raw_text=raw_text,
+            )
+        except Exception as exc:
+            self.logger.exception("Chroma upsert failed for expense_id=%s: %s", expense_id, exc)
+
+    def retrieve_similar_expenses(
+        self,
+        chat_id: int | None,
+        text: str,
+        n_results: int = SIMILAR_EXAMPLES_LIMIT,
+    ) -> list[dict[str, Any]]:
+        if chat_id is None:
+            return []
+
+        normalized_text = collapse_spaces(text)
+        if not normalized_text:
+            return []
+
+        query_embedding = call_ollama_embed(
+            base_url=self.ollama_base_url,
+            model=self.ollama_embed_model,
+            text=normalized_text,
+        )
+        result = self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=max(1, n_results),
+            where={"chat_id": chat_id},
+            include=["documents", "metadatas", "distances"],
+        )
+
+        documents = result.get("documents", [[]])
+        metadatas = result.get("metadatas", [[]])
+        distances = result.get("distances", [[]])
+        if not documents or not isinstance(documents[0], list):
+            return []
+
+        doc_list = documents[0]
+        metadata_list = metadatas[0] if metadatas and isinstance(metadatas[0], list) else []
+        distance_list = distances[0] if distances and isinstance(distances[0], list) else []
+
+        similar_items: list[dict[str, Any]] = []
+        for idx, document in enumerate(doc_list):
+            if not isinstance(document, str):
+                continue
+
+            metadata = metadata_list[idx] if idx < len(metadata_list) else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            distance = distance_list[idx] if idx < len(distance_list) else None
+            if not isinstance(distance, (int, float)):
+                distance = None
+
+            similar_items.append(
+                {
+                    "document": document,
+                    "category": metadata.get("categoria"),
+                    "amount": metadata.get("monto"),
+                    "distance": distance,
+                    "month_key": metadata.get("month_key"),
+                }
+            )
+
+        return similar_items
+
     def store_expense(
         self,
         update_id: int,
@@ -220,9 +310,10 @@ class ExpensePersistence:
             source=source,
         )
 
-        vector_status = "ok"
+        vector_status = "queued"
         try:
-            self._upsert_vector(
+            self._vector_executor.submit(
+                self._upsert_vector_background,
                 expense_id=expense_id,
                 chat_id=chat_id,
                 category=category,
@@ -235,7 +326,7 @@ class ExpensePersistence:
             )
         except Exception as exc:
             vector_status = "error"
-            self.logger.exception("Chroma upsert failed for expense_id=%s: %s", expense_id, exc)
+            self.logger.exception("Unable to queue Chroma upsert for expense_id=%s: %s", expense_id, exc)
 
         return {
             "status": "stored",
@@ -247,4 +338,7 @@ class ExpensePersistence:
         }
 
     def close(self) -> None:
-        self.conn.close()
+        try:
+            self._vector_executor.shutdown(wait=True)
+        finally:
+            self.conn.close()

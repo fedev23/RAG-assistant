@@ -1,10 +1,21 @@
 from dataclasses import dataclass
 import sqlite3
 
+from ollama.backend.formatting import format_money
 from ollama.backend.query.parser import MONTH_MAP
 from ollama.backend.query.parser import QueryIntent
 
 MONTH_NAME_BY_NUMBER = {value: key for key, value in MONTH_MAP.items() if key != "setiembre"}
+CATEGORY_VALUES = {
+    "salida": ("salida",),
+    "obligacion": ("obligacion",),
+    "unclear": ("unclear", "otro"),
+}
+CATEGORY_LABELS = {
+    "salida": "salidas",
+    "obligacion": "obligaciones",
+    "unclear": "unclear",
+}
 
 
 @dataclass(frozen=True)
@@ -42,6 +53,25 @@ class ExpenseQueryService:
             return None
         return int(row[0])
 
+    def _canonical_category(self, category: str) -> str:
+        if category in {"otro", "unclear"}:
+            return "unclear"
+        return category
+
+    def _expand_categories(self, categories: list[str] | None) -> list[str] | None:
+        if not categories:
+            return None
+
+        expanded: list[str] = []
+        for category in categories:
+            canonical = self._canonical_category(category)
+            values = CATEGORY_VALUES.get(canonical, (canonical,))
+            for value in values:
+                if value not in expanded:
+                    expanded.append(value)
+
+        return expanded
+
     def _build_filters(
         self,
         chat_id: int,
@@ -52,17 +82,25 @@ class ExpenseQueryService:
         conditions = ["chat_id = ?", "month_key = ?"]
         params: list = [chat_id, f"{year:04d}-{month:02d}"]
 
-        if categories:
-            placeholders = ", ".join(["?"] * len(categories))
+        expanded_categories = self._expand_categories(categories)
+        if expanded_categories:
+            placeholders = ", ".join(["?"] * len(expanded_categories))
             conditions.append(f"{self.category_column} IN ({placeholders})")
-            params.extend(categories)
+            params.extend(expanded_categories)
 
         return " AND ".join(conditions), params
 
     def _render_scope(self, categories: list[str] | None) -> str:
         if not categories:
             return "all categories"
-        return ", ".join(categories)
+
+        labels: list[str] = []
+        for category in categories:
+            canonical = self._canonical_category(category)
+            label = CATEGORY_LABELS.get(canonical, canonical)
+            if label not in labels:
+                labels.append(label)
+        return ", ".join(labels)
 
     def _sum_for_where(self, where_clause: str, params: list) -> float:
         row = self.conn.execute(
@@ -128,21 +166,24 @@ class ExpenseQueryService:
                 handled=True,
                 text=(
                     f"Maximum expense for {scope} in {month_name} {year}: "
-                    f"{float(value):.2f} {self.default_currency}."
+                    f"{format_money(float(value), self.default_currency)}."
                 ),
             )
 
         if intent.categories is None:
             salida_total = self._sum_for_category(chat_id, intent.month, year, "salida")
             obligacion_total = self._sum_for_category(chat_id, intent.month, year, "obligacion")
-            total = salida_total + obligacion_total
+            unclear_total = self._sum_for_category(chat_id, intent.month, year, "unclear")
+            total = salida_total + obligacion_total + unclear_total
             return QueryResponse(
                 handled=True,
                 text=(
-                    f"Total expense in {month_name} {year}: "
-                    f"salida {salida_total:.2f} {self.default_currency} + "
-                    f"obligacion {obligacion_total:.2f} {self.default_currency} = "
-                    f"{total:.2f} {self.default_currency}."
+                    f"Total expense in {month_name} {year} "
+                    f"(salidas + obligaciones + unclear): "
+                    f"salidas {format_money(salida_total, self.default_currency)} + "
+                    f"obligaciones {format_money(obligacion_total, self.default_currency)} + "
+                    f"unclear {format_money(unclear_total, self.default_currency)} = "
+                    f"{format_money(total, self.default_currency)}."
                 ),
             )
 
@@ -151,6 +192,6 @@ class ExpenseQueryService:
             handled=True,
             text=(
                 f"Total expense for {scope} in {month_name} {year}: "
-                f"{total:.2f} {self.default_currency}."
+                f"{format_money(total, self.default_currency)}."
             ),
         )

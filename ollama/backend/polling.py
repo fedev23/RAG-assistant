@@ -1,6 +1,5 @@
 import json
 import logging
-import re
 import time
 import urllib.error
 from pathlib import Path
@@ -9,12 +8,19 @@ from ollama.backend.clients import call_ollama_extract
 from ollama.backend.clients import call_telegram_api
 from ollama.backend.clients import extract_sender_name
 from ollama.backend.clients import send_telegram_message
-from ollama.backend.parsing import parse_expense_by_rule
+from ollama.backend.formatting import format_money
+from ollama.backend.parsing import normalize_category
 from ollama.backend.query.parser import parse_query_intent
 from ollama.backend.query.service import ExpenseQueryService
 from ollama.backend.storage import ExpensePersistence
 from ollama.backend.storage import load_offset
 from ollama.backend.storage import save_offset
+from ollama.backend.tuning import NEIGHBOR_PRIOR_MIN_CONSIDERED_OVERRIDE
+from ollama.backend.tuning import NEIGHBOR_PRIOR_MIN_CONSIDERED_UNCLEAR
+from ollama.backend.tuning import NEIGHBOR_PRIOR_RATIO_OVERRIDE
+from ollama.backend.tuning import NEIGHBOR_PRIOR_RATIO_UNCLEAR
+from ollama.backend.tuning import NEIGHBOR_PRIOR_TOP_K
+from ollama.backend.tuning import SIMILAR_EXAMPLES_LIMIT
 from ollama.backend.time_utils import get_now_iso_and_epoch
 
 
@@ -27,6 +33,8 @@ def build_expense_event(
     source: str,
     timestamp_iso: str,
     timestamp_epoch: int,
+    similar_examples_count: int,
+    extraction_error: str | None,
 ) -> dict:
     return {
         "update_id": update_id,
@@ -37,6 +45,8 @@ def build_expense_event(
         "detected_expense": expense,
         "timestamp_iso": timestamp_iso,
         "timestamp_epoch": timestamp_epoch,
+        "similar_examples_count": similar_examples_count,
+        "extraction_error": extraction_error,
     }
 
 
@@ -61,22 +71,117 @@ def _build_expense_reply(expense: dict, persistence_result: dict) -> str:
 
     if persistence_result.get("inserted"):
         return (
-            f"Expense saved: {category} {amount:.2f} {currency} "
+            f"Expense saved: {category} {format_money(amount, currency)} "
             f"({month_key})."
         )
     return "This message was already processed before."
 
 
-def _looks_like_expense_message(text: str) -> bool:
-    normalized = " ".join(text.lower().split())
-    has_number = bool(re.search(r"\d", normalized))
-    has_expense_hint = bool(
-        re.search(
-            r"\b(gasto|gaste|gastado|salida|salidas|obligacion|obligaciones|pagu[eé]|pago|compr[eé])\b",
-            normalized,
-        )
+def _neighbor_majority(
+    similar_examples: list[dict],
+    top_k: int = NEIGHBOR_PRIOR_TOP_K,
+) -> tuple[str | None, float, int]:
+    votes: dict[str, int] = {}
+    considered = 0
+
+    for example in similar_examples[:top_k]:
+        category = example.get("category")
+        if not isinstance(category, str):
+            continue
+        normalized = normalize_category(category)
+        votes[normalized] = votes.get(normalized, 0) + 1
+        considered += 1
+
+    if considered == 0:
+        return None, 0.0, 0
+
+    dominant_category, dominant_count = max(votes.items(), key=lambda item: item[1])
+    return dominant_category, dominant_count / considered, considered
+
+
+def _apply_neighbor_prior(
+    expense: dict | None,
+    similar_examples: list[dict],
+    logger: logging.Logger,
+) -> dict | None:
+    if expense is None:
+        return None
+
+    current = expense.get("category")
+    if not isinstance(current, str):
+        return expense
+    current_category = normalize_category(current)
+
+    dominant_category, dominant_ratio, considered = _neighbor_majority(similar_examples)
+    if dominant_category is None or dominant_category == "unclear":
+        return expense
+
+    should_adjust = False
+    if (
+        current_category == "unclear"
+        and considered >= NEIGHBOR_PRIOR_MIN_CONSIDERED_UNCLEAR
+        and dominant_ratio >= NEIGHBOR_PRIOR_RATIO_UNCLEAR
+    ):
+        should_adjust = True
+    elif (
+        current_category != dominant_category
+        and considered >= NEIGHBOR_PRIOR_MIN_CONSIDERED_OVERRIDE
+        and dominant_ratio >= NEIGHBOR_PRIOR_RATIO_OVERRIDE
+    ):
+        should_adjust = True
+
+    if not should_adjust:
+        return expense
+
+    adjusted = dict(expense)
+    adjusted["category"] = dominant_category
+    logger.info(
+        "Neighbor prior adjusted category %s -> %s (ratio=%.2f, considered=%s)",
+        current_category,
+        dominant_category,
+        dominant_ratio,
+        considered,
     )
-    return has_number and has_expense_hint
+    return adjusted
+
+
+def _extract_expense_with_context(
+    persistence: ExpensePersistence,
+    ollama_base_url: str,
+    ollama_model: str,
+    chat_id: int | None,
+    text: str,
+    logger: logging.Logger,
+) -> tuple[dict | None, list[dict], str | None]:
+    similar_examples: list[dict] = []
+    retrieval_error: str | None = None
+
+    try:
+        similar_examples = persistence.retrieve_similar_expenses(
+            chat_id=chat_id,
+            text=text,
+            n_results=SIMILAR_EXAMPLES_LIMIT,
+        )
+    except Exception as exc:
+        retrieval_error = f"vector_retrieval_error: {exc}"
+        logger.warning("Vector retrieval failed, continuing without context: %s", exc)
+
+    try:
+        expense = call_ollama_extract(
+            ollama_base_url,
+            ollama_model,
+            text,
+            similar_examples=similar_examples,
+        )
+        expense = _apply_neighbor_prior(expense=expense, similar_examples=similar_examples, logger=logger)
+    except Exception as exc:
+        logger.exception("Ollama extraction failed: %s", exc)
+        return None, similar_examples, f"llm_error: {exc}"
+
+    if expense is None and retrieval_error is not None:
+        return None, similar_examples, retrieval_error
+
+    return expense, similar_examples, None
 
 
 def run_long_polling(
@@ -161,19 +266,16 @@ def run_long_polling(
                 save_offset(offset_file, offset)
                 continue
 
-            expense = parse_expense_by_rule(text)
-            source = "rule"
-            if expense is None:
-                if _looks_like_expense_message(text):
-                    try:
-                        expense = call_ollama_extract(ollama_base_url, ollama_model, text)
-                        source = "llm"
-                    except Exception as exc:
-                        logger.exception("Ollama extraction failed: %s", exc)
-                        source = "llm_error"
-                else:
-                    source = "not_expense_candidate"
-
+            expense = None
+            source = "llm"
+            expense, similar_examples, extraction_error = _extract_expense_with_context(
+                persistence=persistence,
+                ollama_base_url=ollama_base_url,
+                ollama_model=ollama_model,
+                chat_id=chat_id,
+                text=text,
+                logger=logger,
+            )
             timestamp_iso, timestamp_epoch = get_now_iso_and_epoch(timezone_name, logger=logger)
             event = build_expense_event(
                 update_id=update_id,
@@ -184,6 +286,8 @@ def run_long_polling(
                 source=source,
                 timestamp_iso=timestamp_iso,
                 timestamp_epoch=timestamp_epoch,
+                similar_examples_count=len(similar_examples),
+                extraction_error=extraction_error,
             )
 
             if expense is not None:
@@ -204,17 +308,18 @@ def run_long_polling(
                     logger=logger,
                 )
             else:
+                skip_reason = "no_expense_detected" if extraction_error is None else "expense_extraction_error"
                 event["persistence"] = {
                     "status": "skipped",
-                    "reason": "no_expense_detected",
+                    "reason": skip_reason,
                 }
                 _safe_reply(
                     token=token,
                     chat_id=chat_id,
                     text=(
-                        "I could not detect an expense from that message. "
-                        "You can register one like: 'Gaste 2700 en salidas' "
-                        "or ask: 'cuanto gaste en salidas en febrero'."
+                        "I could not detect an expense from that message."
+                        if extraction_error is None
+                        else "I had a temporary extraction error. Please try again."
                     ),
                     logger=logger,
                 )

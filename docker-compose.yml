@@ -20,7 +20,7 @@ services:
         condition: service_healthy
     environment:
       OLLAMA_HOST: http://ollama:11434
-    entrypoint: ["/bin/sh", "-c", "ollama pull llama3.2:3b && ollama pull nomic-embed-text"]
+    entrypoint: ["/bin/sh", "-c", "ollama pull llama3.2:1b && ollama pull nomic-embed-text"]
     volumes:
       - ollama_data:/root/.ollama
     restart: "no"
@@ -36,7 +36,8 @@ services:
       - ./ollama/backend/.env
     environment:
       OLLAMA_BASE_URL: http://ollama:11434
-      OLLAMA_EXTRACT_MODEL: llama3.2:3b
+      OLLAMA_EXTRACT_MODEL: llama3.2:1b
+      OLLAMA_EXTRACT_NUM_PREDICT: 64
       OLLAMA_EMBED_MODEL: nomic-embed-text
       APP_TIMEZONE: America/Argentina/Buenos_Aires
       APP_CURRENCY: ARS
